@@ -6,12 +6,15 @@
 
 //for logging, compile with "make debug"
 #ifdef SI_DEBUG
-    #define DEBUGPRINT(_fmt, ...) \
+#define DEBUGPRINT(_fmt, ...) \
         do { \
             FILE *logFP = fopen(SI_DEBUG_LOGPATH, "a"); \
-            if(logFP) { fprintf(logFP, _fmt, ##__VA_ARGS__); \
+            struct timeval tm; \
+            gettimeofday(&tm, NULL); \
+            if(logFP) { fprintf(logFP, "%ld.%06ld ", (long int)tm.tv_sec, (long int)tm.tv_usec); \
+			fprintf(logFP, _fmt, ##__VA_ARGS__); \
             fclose(logFP); } \
        } while (0)
 #else
-    #define DEBUGPRINT(_fmt, ...) /**/
+#define DEBUGPRINT(_fmt, ...) /**/
 #endif
