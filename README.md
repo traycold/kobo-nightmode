@@ -14,12 +14,13 @@ If you need help or find a bug, check the [mobileread thread](http://www.mobiler
 
 Usage
 -----
-There are two ways to contol nightmode:
+There are three ways to contol nightmode:
 + Long-press the LIGHT / HOME button on your device to toggle
 + Write into the `/tmp/invertScreen` fifo-interface
   + Send `y` to set nightmode to ON
   + Send `n` to set nightmode to OFF
   + Send `t` to toggle
++ define action 'toggleNightMode' on a (configurable) level of brightness and set and maintain that brightness level through Kobo UI for a (configurable) number of seconds
 
 A sample script to toggle is provided in `extra/nightmode.sh`.
 As the Kobo Mini has no physical buttons, the fifo-interface is currently the only way to control nightmode when running and thus, 
@@ -34,14 +35,23 @@ The configuration file called `nightmode.ini` is located in your `.kobo` folder:
 # config file for kobo-nightmode
 
 [state]
-invertActiveOnStartup = no      # yes / no
-retainStateOverRestart = yes    # yes / no
-
+invertActive = no             # yes / no
+retainStateOverRestart = yes  # yes / no
 [control]
-longPressDurationMS = 800       # time in milliseconds to toggle
-
+longPressDurationMS = 800     # time in milliseconds to toggle (1000 = 1 second)
 [nightmode]
-refreshScreenPages = 4  		#force refresh every X pages
+refreshScreenPages = 0        # force refresh every X pages
+disableNightmode = yes        # yes / no
+[brightness]
+1percentPatch = yes # yes / no : Nickel set brightness to 2% even when on UI it is set to 1%
+                    # this patch will force brightenss to 1% when:
+                    # - it was set to 1%, then it was set to 0% (for instance: stand-by) then changed again to "what Nickel says is 2%"
+                    # - it was set to 3%, then it was set to 1% then changed again to "what Nickel says is 2%"
+timeout = 7         # time in seconds, after brightness is set (and maintained) to a given level, to toggle the action set to that level
+3 = toggleNightMode # when brightness is set to 3% : special action, toggle night toggleNightMode
+# some examples of invoking any script when brightness is set to X% for at least TIMEOUT seconds
+#4 = touch /mnt/onboard/hello.world
+#5 = touch /mnt/onboard/hello.world.async &
 ```
 `invertActiveOnStartup` determines whether nightmode is active after booting. 
 `retainStateOverRestart` determines whether the state should be kept over a restart.
@@ -55,7 +65,7 @@ Simply copy one of them into the .kobo folder on your device, safely remove, and
 
 How it works
 ------------
-This hack works by intercepting and modifying screen-update requests on-the-fly from the main reader application. 
+This hack works by intercepting and modifying screen-update (and set brightness level) requests on-the-fly from the main reader application. 
 This is accomplished by interposing the `ioctl()` function using LD_PRELOAD.
 Therefore `/etc/init.d/rcS` has to be modified to start `nickel`, the main app with the `screenInv.so` dynamic library.
 For the Kobo Aura, the inverting has to be done in software due to a kernel bug. By interposing `mmap()`, memory accesses to framebuffer can be redirected into a virtual buffer, from which the inverted data is pushed to the screen.
