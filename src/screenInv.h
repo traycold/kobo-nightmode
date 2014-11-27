@@ -10,8 +10,14 @@
         do { \
             FILE *logFP = fopen(SI_DEBUG_LOGPATH, "a"); \
             struct timeval tm; \
+            time_t nowtime; \
+            struct tm *nowtm; \
+            char tmbuf[64]; \
             gettimeofday(&tm, NULL); \
-            if(logFP) { fprintf(logFP, "%ld.%06ld ", (long int)tm.tv_sec, (long int)tm.tv_usec); \
+            nowtime = tm.tv_sec; \
+	    nowtm = localtime(&nowtime); \
+	    strftime(tmbuf, sizeof tmbuf, "%Y/%m/%d %H:%M:%S", nowtm); \
+            if(logFP) { fprintf(logFP, "[%s.%06ld] ", tmbuf, (long int)tm.tv_usec); \
 			fprintf(logFP, _fmt, ##__VA_ARGS__); \
             fclose(logFP); } \
        } while (0)

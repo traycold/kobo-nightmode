@@ -62,24 +62,13 @@ static int longPressTimeout = 800;
 static int thresholdScreenArea = 0;
 static int nightRefresh = 3;
 static int nightRefreshCnt = 0;
+static char *brightnessActions[101];
+static int brightnessTimeout = 5;
+static bool brightness1patch = false;
+
 static long flCounter = 0;
 static unsigned long flCurrent = 0;
-
-/* this function is run by the second thread */
-void *processFlChange ( void *flCounterStart_void_ptr ) {
-    long flCounterStart =  * ( ( long * ) flCounterStart_void_ptr );
-    free ( flCounterStart_void_ptr );
-    sleep ( 5 );
-
-    unsigned long flCurrentProcessed = flCurrent;
-    if ( flCounter == flCounterStart ) {
-        flCounter++;
-        DEBUGPRINT ( "executing trigger for flCounter:%ld flCurrent:%ld\n", flCounterStart, flCurrentProcessed );
-    }
-
-    /* the function must return something - NULL will do */
-    return NULL;
-}
+static unsigned long flPrevious = -1;
 
 static void forceUpdate() {
     int ret = -1;
@@ -115,6 +104,17 @@ static void readConfigFile ( bool readState ) {
         if ( iniparser_getboolean ( configIni, "nightmode:forceSWInvert", 0 ) ) {
             DEBUGPRINT ( "ScreenInverter: Forcing SW inversion mode!\n" );
             useHWInvert = false;
+        }
+
+        char brightnessKey[14];
+        brightnessTimeout = iniparser_getint ( configIni, "brightness:timeout", 5 );
+	brightness1patch = iniparser_getboolean ( configIni, "brightness:1percentPatch", 0 );
+        for ( int i=0; i<101; i++ ) {
+            sprintf ( brightnessKey,"brightness:%d",i );
+            brightnessActions[i] = iniparser_getstring ( configIni, brightnessKey,'\0' );
+            if ( brightnessActions[i] ) {
+                DEBUGPRINT ( "Action for brightness %d: '%s'\n", i, brightnessActions[i] );
+            }
         }
 
         if ( longPressTimeout < 1 ) longPressTimeout = 800;
@@ -419,16 +419,43 @@ void benchmark(struct mxcfb_rect *region)
 	DEBUGPRINT("10x copy took %" PRIu64 "\n", diff);
 }*/
 
+/* this function is run by the second thread */
+void *processFlChange ( void *flCounterStart_void_ptr ) {
+    long flCounterStart =  * ( ( long * ) flCounterStart_void_ptr );
+    free ( flCounterStart_void_ptr );
+    sleep ( brightnessTimeout );
+
+    unsigned long flCurrentProcessed = flCurrent;
+    if ( flCounter == flCounterStart ) {
+        flCounter++;
+        DEBUGPRINT ( "executing trigger for flCounter:%ld flCurrent:%ld\n", flCounterStart, flCurrentProcessed );
+        if ( flCurrentProcessed>=0 && flCurrentProcessed<=100 && brightnessActions[flCurrentProcessed] ) {
+            if ( strcmp ( brightnessActions[flCurrentProcessed], "toggleNightMode" ) == 0 ) {
+                DEBUGPRINT ( "setNewState by brightness trigger\n" );
+                setNewState ( !inversionActive );
+            } else {
+                DEBUGPRINT ( "executing command: '%s'\n", brightnessActions[flCurrentProcessed] );
+                system ( brightnessActions[flCurrentProcessed] );
+            }
+        }
+    }
+
+    /* the function must return something - NULL will do */
+    return NULL;
+}
+
 int ioctl ( int filp, unsigned long cmd, unsigned long arg ) {
     if ( cmd == MXCFB_SEND_UPDATE ) {
 
         struct mxcfb_update_data *region = ( struct mxcfb_update_data * ) arg;
 
-        DEBUGPRINT ( "ScreenInverter: update: type:%s, flags:0x%x, size:%dx%d (%d%% updated)\n",
-                     region->update_mode == UPDATE_MODE_PARTIAL? "partial" : "full", region->flags,
-                     region->update_region.width, region->update_region.height,
-                     ( 100*region->update_region.width*region->update_region.height ) /
-                     ( fullUpdRegion.update_region.width*fullUpdRegion.update_region.height ) );
+        /*
+                DEBUGPRINT ( "ScreenInverter: update: type:%s, flags:0x%x, size:%dx%d (%d%% updated)\n",
+                             region->update_mode == UPDATE_MODE_PARTIAL? "partial" : "full", region->flags,
+                             region->update_region.width, region->update_region.height,
+                             ( 100*region->update_region.width*region->update_region.height ) /
+                             ( fullUpdRegion.update_region.width*fullUpdRegion.update_region.height ) );
+        */
 
         if ( inversionActive && nightRefresh ) {
             if ( region->update_region.width * region->update_region.height >= thresholdScreenArea ) {
@@ -477,10 +504,27 @@ int ioctl ( int filp, unsigned long cmd, unsigned long arg ) {
         return 0;
     } else if ( cmd == 241 ) {
         DEBUGPRINT ( "ScreenInverter: Command setting frontlight %ld \n" , arg );
+	if(brightness1patch) {
+	  //special case: Nickel returns 2 even when on UI the brightness is set to 1%
+	  // so when it change 1->0->2 --> set to 1
+	  //                   3->2->2 --> set to 1
+	  if (arg==2 && flCurrent==0 && flPrevious==1) {
+	    DEBUGPRINT ( "forcing brightness to 1 instead of 2 (1 -> 0 -> 2=>1)\n");
+	    // turning on light when it was set to 1:
+	    // first of all set it to 2 (otherwise it will not turn on)
+	    ioctl_orig ( filp, cmd, arg );
+	    // then set it to 1
+	    arg = 1;
+	  } else if (arg==2 && flCurrent==2 && flPrevious==3) {
+	    DEBUGPRINT ( "forcing brightness to 1 instead of 2 (3 -> 2 -> 2=>1)\n");
+	    // stepping down from 3 to 2 to 1
+	    arg = 1;
+	  }
+	}
+        flPrevious = flCurrent;
         flCurrent = arg;
-        flCounter++;
-        if ( arg==3 ) {
-            flCurrent = arg;
+        flCounter = ( flCounter+1 ) % 20000;
+        if ( arg>=0 && arg<=100 && brightnessActions[arg] ) {
             pthread_t thread;
             long *flCounterArg = malloc ( sizeof ( *flCounterArg ) );
             *flCounterArg = flCounter;
