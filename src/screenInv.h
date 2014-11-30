@@ -19,6 +19,7 @@
 	    strftime(tmbuf, sizeof tmbuf, "%Y/%m/%d %H:%M:%S", nowtm); \
             if(logFP) { fprintf(logFP, "[%s.%06ld] ", tmbuf, (long int)tm.tv_usec); \
 			fprintf(logFP, _fmt, ##__VA_ARGS__); \
+			fprintf(logFP, "\n"); \
             fclose(logFP); } \
        } while (0)
 #else

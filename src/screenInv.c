@@ -40,6 +40,7 @@ void *mmap ( void *addr, size_t length, int prot, int flags, int fd, off_t offse
 //original funcs
 static int ( *ioctl_orig ) ( int filp, unsigned long cmd, unsigned long arg ) = NULL;
 static void* ( *mmap_orig ) ( void *addr, size_t length, int prot, int flags, int fd, off_t offset ) = NULL;
+static int ( *system_orig) (const char *command) = NULL;
 
 
 static void initialize() __attribute__ ( ( constructor ) );
@@ -65,6 +66,11 @@ static int nightRefreshCnt = 0;
 static char *brightnessActions[101];
 static int brightnessTimeout = 5;
 static bool brightness1patch = false;
+static bool lightButtonToggleNightMode = true;
+static bool lightButtonLaunchCommand = false;
+static char *lightButtonCommand = NULL;
+static struct timeval lastIoctlTime;
+static int autoSwitchOffTimeoutSeconds = 3600*24;
 
 static long flCounter = 0;
 static unsigned long flCurrent = 0;
@@ -83,7 +89,7 @@ static void forceUpdate() {
 
 #ifdef SI_DEBUG
     if ( ret < 0 ) {
-        DEBUGPRINT ( "ScreenInverter: Full redraw failed! Error %d: %s\n", ret, strerror ( errno ) );
+        DEBUGPRINT ( "ScreenInverter: Full redraw failed! Error %d: %s", ret, strerror ( errno ) );
         system ( "dmesg | grep mxc_epdc_fb: > /mnt/onboard/.kobo/screenInvertLogFB" );
     }
 #else
@@ -102,36 +108,51 @@ static void readConfigFile ( bool readState ) {
         nightRefresh = iniparser_getint ( configIni, "nightmode:refreshScreenPages", 3 );
 
         if ( iniparser_getboolean ( configIni, "nightmode:forceSWInvert", 0 ) ) {
-            DEBUGPRINT ( "ScreenInverter: Forcing SW inversion mode!\n" );
+            DEBUGPRINT ( "ScreenInverter: Forcing SW inversion mode!" );
             useHWInvert = false;
         }
 
+        char *lighButtonAction = iniparser_getstring ( configIni, "control:lightButtonAction", "toggleNightMode" );
+        if ( strcmp ( "launchCommand", lighButtonAction ) ) {
+            lightButtonToggleNightMode = false;
+            lightButtonLaunchCommand = true;
+        } else if ( strcmp ( "both", lighButtonAction ) ) {
+            lightButtonToggleNightMode = true;
+            lightButtonLaunchCommand = true;
+        } else {
+            //default: toggleNightMode
+            lightButtonToggleNightMode = true;
+            lightButtonLaunchCommand = false;
+        }
+
+        lightButtonCommand = iniparser_getstring ( configIni, "control:lightButtonScript",'\0' );
+
         char brightnessKey[14];
         brightnessTimeout = iniparser_getint ( configIni, "brightness:timeout", 5 );
-	brightness1patch = iniparser_getboolean ( configIni, "brightness:1percentPatch", 0 );
+        brightness1patch = iniparser_getboolean ( configIni, "brightness:1percentPatch", 0 );
         for ( int i=0; i<101; i++ ) {
             sprintf ( brightnessKey,"brightness:%d",i );
             brightnessActions[i] = iniparser_getstring ( configIni, brightnessKey,'\0' );
             if ( brightnessActions[i] ) {
-                DEBUGPRINT ( "Action for brightness %d: '%s'\n", i, brightnessActions[i] );
+                DEBUGPRINT ( "Action for brightness %d: '%s'", i, brightnessActions[i] );
             }
         }
 
         if ( longPressTimeout < 1 ) longPressTimeout = 800;
         if ( nightRefresh < 1 ) nightRefresh = 0;
 
-        DEBUGPRINT ( "ScreenInverter: Read config: invert(%s), retain(%s), longPressTimeout(%d), nightRefresh(%d)\n",
+        DEBUGPRINT ( "ScreenInverter: Read config: invert(%s), retain(%s), longPressTimeout(%d), nightRefresh(%d)",
                      inversionActive? "yes" : "no",
                      retainState? "yes" : "no",
                      longPressTimeout, nightRefresh );
     } else
-        DEBUGPRINT ( "ScreenInverter: Config file invalid or not found, using defaults\n" );
+        DEBUGPRINT ( "ScreenInverter: Config file invalid or not found, using defaults" );
 }
 
 static time_t getLastConfigChange() {
     struct stat confStat;
     if ( stat ( SI_CONFIG_FILE, &confStat ) ) {
-        DEBUGPRINT ( "ScreenInverter: Could no stat() config file\n" );
+        DEBUGPRINT ( "ScreenInverter: Could no stat() config file" );
         return 0;
     }
 
@@ -174,8 +195,20 @@ static void *buttonReader ( void *arg ) {
 
         if ( err == 0 ) { //nothing to read, but timeout
             timeOut = -1;
-            setNewState ( !inversionActive );
-            DEBUGPRINT ( "ScreenInverter: Toggled using button\n" );
+            DEBUGPRINT ( "ScreenInverter: Light Button action triggered" );
+            if ( lightButtonToggleNightMode ) {
+                // toggle night mode
+                setNewState ( !inversionActive );
+            } 
+            if ( lightButtonLaunchCommand ) {
+                // lauch script
+                DEBUGPRINT ( "ScreenInverter: launching script '%s'" , lightButtonScript );
+                FILE * commandFile = fopen ( lightButtonCommand, "r" );
+                if ( commandFile != NULL ) {
+                    fclose ( commandFile );
+                    system ( lightButtonCommand );
+                }
+            }
             continue;
         }
 
@@ -222,20 +255,20 @@ static void *cmdReader ( void *arg ) {
             switch ( input ) {
             case 't': //toggle
                 setNewState ( !inversionActive );
-                DEBUGPRINT ( "ScreenInverter: Toggled\n" );
+                DEBUGPRINT ( "ScreenInverter: Toggled" );
                 break;
             case 'y': //yes
                 setNewState ( true );
-                DEBUGPRINT ( "ScreenInverter: Inversion on\n" );
+                DEBUGPRINT ( "ScreenInverter: Inversion on" );
                 break;
             case 'n': //no
                 setNewState ( false );
-                DEBUGPRINT ( "ScreenInverter: Inversion off\n" );
+                DEBUGPRINT ( "ScreenInverter: Inversion off" );
                 break;
             case 10: //ignore linefeed
                 break;
             default:
-                DEBUGPRINT ( "ScreenInverter: Unknown command!\n" );
+                DEBUGPRINT ( "ScreenInverter: Unknown command!" );
                 break;
             }
         }
@@ -246,16 +279,16 @@ static void *cmdReader ( void *arg ) {
 
 static bool updateVarScreenInfo() {
     if ( ioctl_orig ( fb0fd, FBIOGET_FSCREENINFO, ( long unsigned ) &finfo ) < 0 ) {
-        DEBUGPRINT ( "ScreenInverter: Couldn't get framebuffer infos!\n" );
+        DEBUGPRINT ( "ScreenInverter: Couldn't get framebuffer infos!" );
         return false;
     }
 
     if ( ioctl_orig ( fb0fd, FBIOGET_VSCREENINFO, ( long unsigned ) &vinfo ) < 0 ) {
-        DEBUGPRINT ( "ScreenInverter: Couldn't get display dimensions!\n" );
+        DEBUGPRINT ( "ScreenInverter: Couldn't get display dimensions!" );
         return false;
     }
 
-    DEBUGPRINT ( "ScreenInverter: Got screen resolution: %dx%d @%dBPP, at %d° degrees rotation\n", vinfo.xres, vinfo.yres, vinfo.bits_per_pixel, 90*vinfo.rotate );
+    DEBUGPRINT ( "ScreenInverter: Got screen resolution: %dx%d @%dBPP, at %d° degrees rotation", vinfo.xres, vinfo.yres, vinfo.bits_per_pixel, 90*vinfo.rotate );
     thresholdScreenArea = ( SI_AREA_THRESHOLD * vinfo.xres * vinfo.yres ) / 100;
 
     fullUpdRegion.update_region.width = vinfo.xres;
@@ -264,9 +297,24 @@ static bool updateVarScreenInfo() {
     return true;
 }
 
+static void *manageSwitchOff () {
+  struct timeval now;
+  while(1){
+    gettimeofday(&now, NULL);
+    DEBUGPRINT ("manageSwitchOff: sleeping for %ld seconds", (autoSwitchOffTimeoutSeconds - (now.tv_sec-lastIoctlTime.tv_sec)) ); 
+    sleep(autoSwitchOffTimeoutSeconds - (now.tv_sec-lastIoctlTime.tv_sec) );
+    gettimeofday(&now, NULL);
+    if( (now.tv_sec-lastIoctlTime.tv_sec) >= (autoSwitchOffTimeoutSeconds-5) ){
+      DEBUGPRINT ( "should poweroff.." );
+      return NULL;
+    }
+  }
+}
+
 static void initialize() {
     ioctl_orig = ( int ( * ) ( int filp, unsigned long cmd, unsigned long arg ) ) dlsym ( RTLD_NEXT, "ioctl" );
     mmap_orig = ( void* ( * ) ( void *addr, size_t length, int prot, int flags, int fd, off_t offset ) ) dlsym ( RTLD_NEXT, "mmap" );
+    system_orig = ( int ( * ) ( const char *command ) ) dlsym ( RTLD_NEXT, "system" );
 
 #ifdef SI_DEBUG
     char execPath[32];
@@ -276,17 +324,17 @@ static void initialize() {
     remove ( SI_DEBUG_LOGPATH );
 #endif
 
-    DEBUGPRINT ( "ScreenInverter: Hooked to %s!\n", execPath );
+    DEBUGPRINT ( "ScreenInverter: Hooked to %s!", execPath );
 
     unsetenv ( "LD_PRELOAD" );
-    DEBUGPRINT ( "ScreenInverter: Removed LD_PRELOAD!\n" );
+    DEBUGPRINT ( "ScreenInverter: Removed LD_PRELOAD!" );
 
     //read device
     FILE *devReader = NULL;
     char codename[32];
     DEBUGPRINT ( "ScreenInverter: Reading device type: " );
     if ( ( devReader = popen ( "/bin/kobo_config.sh", "r" ) ) < 0 ) {
-        DEBUGPRINT ( "... failed!\n" );
+        DEBUGPRINT ( "... failed!" );
         return;
     }
 
@@ -296,37 +344,37 @@ static void initialize() {
     if ( codename[lastChar] == '\n' )
         codename[lastChar] = 0;
 
-    DEBUGPRINT ( "%s\n", codename );
+    DEBUGPRINT ( "%s", codename );
     if ( !strcmp ( "pixie", codename ) ||
             !strcmp ( "trilogy", codename ) ||
             !strcmp ( "kraken", codename ) ||
             !strcmp ( "dragon", codename ) ) {
         useHWInvert = true;
-        DEBUGPRINT ( "ScreenInverter: Device supports HW invert!\n" );
+        DEBUGPRINT ( "ScreenInverter: Device supports HW invert!" );
     } else
-        DEBUGPRINT ( "ScreenInverter: No HW inversion support, falling back to SW.\n" );
+        DEBUGPRINT ( "ScreenInverter: No HW inversion support, falling back to SW." );
 
     pclose ( devReader );
 
     if ( ( fb0fd = open ( "/dev/fb0", O_RDWR ) ) == -1 ) {
-        DEBUGPRINT ( "ScreenInverter: Error opening /dev/fb0!\n" );
+        DEBUGPRINT ( "ScreenInverter: Error opening /dev/fb0!" );
 
         close ( fb0fd );
-        DEBUGPRINT ( "ScreenInverter: Disabled!\n" );
+        DEBUGPRINT ( "ScreenInverter: Disabled!" );
         return;
     }
 
     //get the screen's resolution
     if ( !updateVarScreenInfo() ) {
         close ( fb0fd );
-        DEBUGPRINT ( "ScreenInverter: Disabled!\n" );
+        DEBUGPRINT ( "ScreenInverter: Disabled!" );
         return;
     }
 
     fbMemory = ( uint16_t* ) mmap_orig ( 0, finfo.smem_len, PROT_READ | PROT_WRITE, MAP_SHARED, fb0fd, 0 );
 
     if ( ( int ) fbMemory == -1 ) {
-        DEBUGPRINT ( "ScreenInverter: Failed to map framebuffer device to memory.\n" );
+        DEBUGPRINT ( "ScreenInverter: Failed to map framebuffer device to memory." );
 
         close ( fb0fd );
         return;
@@ -361,6 +409,14 @@ static void initialize() {
     if ( !useHWInvert ) {
         virtualFB = ( uint16_t * ) mmap_orig ( NULL, finfo.smem_len, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0 );
     }
+    
+    
+    //create and start thread for managing auto-shut-off
+    gettimeofday(&lastIoctlTime,NULL);
+    pthread_t thread;
+    if ( pthread_create ( &thread, NULL, manageSwitchOff, NULL ) ) {
+	DEBUGPRINT ( "cannot create thread for autoSwitchOff management" );
+    }    
 }
 
 static void cleanup() {
@@ -371,7 +427,7 @@ static void cleanup() {
         pthread_cancel ( buttonReaderThread );
         remove ( SI_CONTROL_PIPE );
         close ( fb0fd );
-        DEBUGPRINT ( "ScreenInverter: Shut down!\n" );
+        DEBUGPRINT ( "ScreenInverter: Shut down!" );
     }
 }
 
@@ -416,7 +472,7 @@ void benchmark(struct mxcfb_rect *region)
 	swCopyRegion(region);
 	gettimeofday(&stop, NULL);
 	uint64_t diff = ((uint64_t)stop.tv_sec * 1000000 + (uint64_t)stop.tv_usec) - ((uint64_t)start.tv_sec * 1000000 + (uint64_t)start.tv_usec);
-	DEBUGPRINT("10x copy took %" PRIu64 "\n", diff);
+	DEBUGPRINT("10x copy took %" PRIu64 "", diff);
 }*/
 
 /* this function is run by the second thread */
@@ -428,13 +484,19 @@ void *processFlChange ( void *flCounterStart_void_ptr ) {
     unsigned long flCurrentProcessed = flCurrent;
     if ( flCounter == flCounterStart ) {
         flCounter++;
-        DEBUGPRINT ( "executing trigger for flCounter:%ld flCurrent:%ld\n", flCounterStart, flCurrentProcessed );
+        DEBUGPRINT ( "executing trigger for flCounter:%ld flCurrent:%ld", flCounterStart, flCurrentProcessed );
         if ( flCurrentProcessed>=0 && flCurrentProcessed<=100 && brightnessActions[flCurrentProcessed] ) {
             if ( strcmp ( brightnessActions[flCurrentProcessed], "toggleNightMode" ) == 0 ) {
-                DEBUGPRINT ( "setNewState by brightness trigger\n" );
+                DEBUGPRINT ( "brightness trigger, toggleNightMode" );
                 setNewState ( !inversionActive );
-            } else {
-                DEBUGPRINT ( "executing command: '%s'\n", brightnessActions[flCurrentProcessed] );
+            } else if ( strcmp ( brightnessActions[flCurrentProcessed], "enableNightMode" ) == 0 ) {
+                DEBUGPRINT ( "brightness trigger, nightMode enabled" );
+                setNewState ( true );
+            } else if ( strcmp ( brightnessActions[flCurrentProcessed], "disableNightMode" ) == 0 ) {
+                DEBUGPRINT ( "brightness trigger, nightMode disabled" );
+                setNewState ( false );
+	    } else {
+                DEBUGPRINT ( "brightness trigger, executing command: '%s'", brightnessActions[flCurrentProcessed] );
                 system ( brightnessActions[flCurrentProcessed] );
             }
         }
@@ -444,13 +506,22 @@ void *processFlChange ( void *flCounterStart_void_ptr ) {
     return NULL;
 }
 
+int system ( const char *command ) {
+  DEBUGPRINT ( "system called: %s", command );
+  return system_orig(command);
+}
+
 int ioctl ( int filp, unsigned long cmd, unsigned long arg ) {
+  
+    //record last ioctl command executed (for auto switch-off feature
+    gettimeofday(&lastIoctlTime, NULL);
+
     if ( cmd == MXCFB_SEND_UPDATE ) {
 
         struct mxcfb_update_data *region = ( struct mxcfb_update_data * ) arg;
 
         /*
-                DEBUGPRINT ( "ScreenInverter: update: type:%s, flags:0x%x, size:%dx%d (%d%% updated)\n",
+                DEBUGPRINT ( "ScreenInverter: update: type:%s, flags:0x%x, size:%dx%d (%d%% updated)",
                              region->update_mode == UPDATE_MODE_PARTIAL? "partial" : "full", region->flags,
                              region->update_region.width, region->update_region.height,
                              ( 100*region->update_region.width*region->update_region.height ) /
@@ -467,13 +538,13 @@ int ioctl ( int filp, unsigned long cmd, unsigned long arg ) {
                     region->update_region.height = fullUpdRegion.update_region.height;
                     region->update_mode = UPDATE_MODE_FULL;
                     nightRefreshCnt = 0;
-                    DEBUGPRINT ( "ScreenInverter: nightRefresh: refreshing screen\n" );
+                    DEBUGPRINT ( "ScreenInverter: nightRefresh: refreshing screen" );
                 } else {
                     region->update_mode = UPDATE_MODE_PARTIAL;
-                    DEBUGPRINT ( "ScreenInverter: nightRefresh: no refresh, page %d\n", nightRefreshCnt );
+                    DEBUGPRINT ( "ScreenInverter: nightRefresh: no refresh, page %d", nightRefreshCnt );
                 }
             } else {
-                DEBUGPRINT ( "ScreenInverter: nightRefresh: small update, ignoring\n" );
+                DEBUGPRINT ( "ScreenInverter: nightRefresh: small update, ignoring" );
             }
         }
 
@@ -495,32 +566,32 @@ int ioctl ( int filp, unsigned long cmd, unsigned long arg ) {
                 swCopyRegion ( &region->update_region );
         }
     } else if ( cmd == FBIOPUT_VSCREENINFO ) {
-        DEBUGPRINT ( "ScreenInverter: Screen dimensions changed, updating...\n" );
+        DEBUGPRINT ( "ScreenInverter: Screen dimensions changed, updating..." );
         int ret =  ioctl_orig ( filp, cmd, arg ); //neccessary, since the kernel makes changes to var & fix infos
         updateVarScreenInfo();
         return ret;
     } else if ( cmd == EVIOCGRAB ) {
-        DEBUGPRINT ( "ScreenInverter: Ignoring nickels request for exclusive access to /dev/input/event0\n" );
+        DEBUGPRINT ( "ScreenInverter: Ignoring nickels request for exclusive access to /dev/input/event0" );
         return 0;
     } else if ( cmd == 241 ) {
-        DEBUGPRINT ( "ScreenInverter: Command setting frontlight %ld \n" , arg );
-	if(brightness1patch) {
-	  //special case: Nickel returns 2 even when on UI the brightness is set to 1%
-	  // so when it change 1->0->2 --> set to 1
-	  //                   3->2->2 --> set to 1
-	  if (arg==2 && flCurrent==0 && flPrevious==1) {
-	    DEBUGPRINT ( "forcing brightness to 1 instead of 2 (1 -> 0 -> 2=>1)\n");
-	    // turning on light when it was set to 1:
-	    // first of all set it to 2 (otherwise it will not turn on)
-	    ioctl_orig ( filp, cmd, arg );
-	    // then set it to 1
-	    arg = 1;
-	  } else if (arg==2 && flCurrent==2 && flPrevious==3) {
-	    DEBUGPRINT ( "forcing brightness to 1 instead of 2 (3 -> 2 -> 2=>1)\n");
-	    // stepping down from 3 to 2 to 1
-	    arg = 1;
-	  }
-	}
+        DEBUGPRINT ( "ScreenInverter: Command setting frontlight %ld" , arg );
+        if ( brightness1patch ) {
+            //special case: Nickel returns 2 even when on UI the brightness is set to 1%
+            // so when it change 1->0->2 --> set to 1
+            //                   3->2->2 --> set to 1
+            if ( arg==2 && flCurrent==0 && flPrevious==1 ) {
+                DEBUGPRINT ( "forcing brightness to 1 instead of 2 (1 -> 0 -> 2=>1)" );
+                // turning on light when it was set to 1:
+                // first of all set it to 2 (otherwise it will not turn on)
+                ioctl_orig ( filp, cmd, arg );
+                // then set it to 1
+                arg = 1;
+            } else if ( arg==2 && flCurrent==2 && flPrevious==3 ) {
+                DEBUGPRINT ( "forcing brightness to 1 instead of 2 (3 -> 2 -> 2=>1)" );
+                // stepping down from 3 to 2 to 1
+                arg = 1;
+            }
+        }
         flPrevious = flCurrent;
         flCurrent = arg;
         flCounter = ( flCounter+1 ) % 20000;
@@ -533,7 +604,8 @@ int ioctl ( int filp, unsigned long cmd, unsigned long arg ) {
             }
         }
     }
-
+    
+    //DEBUGPRINT ( "ioctl cmd: %ld - arg: %ld", cmd, arg );
     return ioctl_orig ( filp, cmd, arg );
 }
 
@@ -545,7 +617,7 @@ void *mmap ( void *addr, size_t length, int prot, int flags, int fd, off_t offse
         int end = readlink ( link, path, 31 );
         path[end] = 0;
         if ( strncmp ( "/dev/fb0", path, 31 ) == 0 ) { //okay, nickel is mmap'ing the framebuffer
-            DEBUGPRINT ( "ScreenInverter: mmap'ed the virtual framebuffer!\n" );
+            DEBUGPRINT ( "ScreenInverter: mmap'ed the virtual framebuffer!" );
             return virtualFB;
         }
     }
