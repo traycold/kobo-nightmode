@@ -40,8 +40,6 @@ void *mmap ( void *addr, size_t length, int prot, int flags, int fd, off_t offse
 //original funcs
 static int ( *ioctl_orig ) ( int filp, unsigned long cmd, unsigned long arg ) = NULL;
 static void* ( *mmap_orig ) ( void *addr, size_t length, int prot, int flags, int fd, off_t offset ) = NULL;
-static int ( *system_orig) (const char *command) = NULL;
-
 
 static void initialize() __attribute__ ( ( constructor ) );
 static void cleanup() __attribute__ ( ( destructor ) );
@@ -70,7 +68,7 @@ static bool lightButtonToggleNightMode = true;
 static bool lightButtonLaunchCommand = false;
 static char *lightButtonCommand = NULL;
 static struct timeval lastIoctlTime;
-static int autoSwitchOffTimeoutSeconds = 3600*24;
+static int autoSwitchOffTimeoutSeconds = 0;
 
 static long flCounter = 0;
 static unsigned long flCurrent = 0;
@@ -113,10 +111,10 @@ static void readConfigFile ( bool readState ) {
         }
 
         char *lighButtonAction = iniparser_getstring ( configIni, "control:lightButtonAction", "toggleNightMode" );
-        if ( strcmp ( "launchCommand", lighButtonAction ) ) {
+        if ( !strcmp ( "launchCommand", lighButtonAction ) ) {
             lightButtonToggleNightMode = false;
             lightButtonLaunchCommand = true;
-        } else if ( strcmp ( "both", lighButtonAction ) ) {
+        } else if ( !strcmp ( "both", lighButtonAction ) ) {
             lightButtonToggleNightMode = true;
             lightButtonLaunchCommand = true;
         } else {
@@ -125,7 +123,7 @@ static void readConfigFile ( bool readState ) {
             lightButtonLaunchCommand = false;
         }
 
-        lightButtonCommand = iniparser_getstring ( configIni, "control:lightButtonScript",'\0' );
+        lightButtonCommand = iniparser_getstring ( configIni, "control:lightButtonCommand",'\0' );
 
         char brightnessKey[14];
         brightnessTimeout = iniparser_getint ( configIni, "brightness:timeout", 5 );
@@ -138,13 +136,22 @@ static void readConfigFile ( bool readState ) {
             }
         }
 
+        autoSwitchOffTimeoutSeconds = iniparser_getint ( configIni, "control:switchOffTimeout", 0 );
+
         if ( longPressTimeout < 1 ) longPressTimeout = 800;
         if ( nightRefresh < 1 ) nightRefresh = 0;
 
-        DEBUGPRINT ( "ScreenInverter: Read config: invert(%s), retain(%s), longPressTimeout(%d), nightRefresh(%d)",
+        DEBUGPRINT ( "ScreenInverter: Read config: invert(%s), retain(%s), longPressTimeout(%d), nightRefresh(%d), lightButtonAction(%s), lightButtonToggleNightMode(%s), lightButtonLaunchCommand(%s), lightButtonCommand(%s), brightness:timeout(%d), brightness:1percentPatch(%s)",
                      inversionActive? "yes" : "no",
                      retainState? "yes" : "no",
-                     longPressTimeout, nightRefresh );
+                     longPressTimeout, nightRefresh,
+                     lighButtonAction,
+                     lightButtonToggleNightMode? "yes" : "no",
+                     lightButtonLaunchCommand? "yes" : "no",
+                     lightButtonCommand,
+                     brightnessTimeout,
+                     brightness1patch? "yes" : "no"
+                   );
     } else
         DEBUGPRINT ( "ScreenInverter: Config file invalid or not found, using defaults" );
 }
@@ -160,6 +167,9 @@ static time_t getLastConfigChange() {
 }
 
 static void setNewState ( bool newState ) {
+
+    DEBUGPRINT ( "ScreenInverter: setNewState(%s)" , newState?"yes":"no" );
+
     inversionActive = newState;
     forceUpdate();
 
@@ -199,15 +209,11 @@ static void *buttonReader ( void *arg ) {
             if ( lightButtonToggleNightMode ) {
                 // toggle night mode
                 setNewState ( !inversionActive );
-            } 
+            }
             if ( lightButtonLaunchCommand ) {
                 // lauch script
-                DEBUGPRINT ( "ScreenInverter: launching script '%s'" , lightButtonScript );
-                FILE * commandFile = fopen ( lightButtonCommand, "r" );
-                if ( commandFile != NULL ) {
-                    fclose ( commandFile );
-                    system ( lightButtonCommand );
-                }
+                DEBUGPRINT ( "ScreenInverter: launching script '%s'" , lightButtonCommand );
+                system ( lightButtonCommand );
             }
             continue;
         }
@@ -298,23 +304,26 @@ static bool updateVarScreenInfo() {
 }
 
 static void *manageSwitchOff () {
-  struct timeval now;
-  while(1){
-    gettimeofday(&now, NULL);
-    DEBUGPRINT ("manageSwitchOff: sleeping for %ld seconds", (autoSwitchOffTimeoutSeconds - (now.tv_sec-lastIoctlTime.tv_sec)) ); 
-    sleep(autoSwitchOffTimeoutSeconds - (now.tv_sec-lastIoctlTime.tv_sec) );
-    gettimeofday(&now, NULL);
-    if( (now.tv_sec-lastIoctlTime.tv_sec) >= (autoSwitchOffTimeoutSeconds-5) ){
-      DEBUGPRINT ( "should poweroff.." );
-      return NULL;
+    struct timeval now, timeToSleep;
+    while ( 1 ) {
+        gettimeofday ( &now, NULL );
+        DEBUGPRINT ( "manageSwitchOff: sleeping for %ld seconds", ( autoSwitchOffTimeoutSeconds - ( now.tv_sec-lastIoctlTime.tv_sec ) ) );
+        timeToSleep.tv_sec = autoSwitchOffTimeoutSeconds - ( now.tv_sec-lastIoctlTime.tv_sec );
+        timeToSleep.tv_usec = 0;
+        select ( 0, NULL, NULL, NULL, &timeToSleep );
+        gettimeofday ( &now, NULL );
+        if ( ( now.tv_sec-lastIoctlTime.tv_sec ) >= ( autoSwitchOffTimeoutSeconds-5 ) ) {
+            DEBUGPRINT ( "should poweroff.." );
+            return NULL;
+        } else {
+            DEBUGPRINT ( "should NOT poweroff, new cycle.." );
+        }
     }
-  }
 }
 
 static void initialize() {
     ioctl_orig = ( int ( * ) ( int filp, unsigned long cmd, unsigned long arg ) ) dlsym ( RTLD_NEXT, "ioctl" );
     mmap_orig = ( void* ( * ) ( void *addr, size_t length, int prot, int flags, int fd, off_t offset ) ) dlsym ( RTLD_NEXT, "mmap" );
-    system_orig = ( int ( * ) ( const char *command ) ) dlsym ( RTLD_NEXT, "system" );
 
 #ifdef SI_DEBUG
     char execPath[32];
@@ -409,14 +418,16 @@ static void initialize() {
     if ( !useHWInvert ) {
         virtualFB = ( uint16_t * ) mmap_orig ( NULL, finfo.smem_len, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0 );
     }
-    
-    
+
+
     //create and start thread for managing auto-shut-off
-    gettimeofday(&lastIoctlTime,NULL);
-    pthread_t thread;
-    if ( pthread_create ( &thread, NULL, manageSwitchOff, NULL ) ) {
-	DEBUGPRINT ( "cannot create thread for autoSwitchOff management" );
-    }    
+    if ( autoSwitchOffTimeoutSeconds > 0 ) {
+        gettimeofday ( &lastIoctlTime,NULL );
+        pthread_t thread;
+        if ( pthread_create ( &thread, NULL, manageSwitchOff, NULL ) ) {
+            DEBUGPRINT ( "cannot create thread for autoSwitchOff management" );
+        }
+    }
 }
 
 static void cleanup() {
@@ -486,16 +497,16 @@ void *processFlChange ( void *flCounterStart_void_ptr ) {
         flCounter++;
         DEBUGPRINT ( "executing trigger for flCounter:%ld flCurrent:%ld", flCounterStart, flCurrentProcessed );
         if ( flCurrentProcessed>=0 && flCurrentProcessed<=100 && brightnessActions[flCurrentProcessed] ) {
-            if ( strcmp ( brightnessActions[flCurrentProcessed], "toggleNightMode" ) == 0 ) {
+            if ( !strcmp ( brightnessActions[flCurrentProcessed], "toggleNightMode" ) ) {
                 DEBUGPRINT ( "brightness trigger, toggleNightMode" );
                 setNewState ( !inversionActive );
-            } else if ( strcmp ( brightnessActions[flCurrentProcessed], "enableNightMode" ) == 0 ) {
+            } else if ( !strcmp ( brightnessActions[flCurrentProcessed], "enableNightMode" ) ) {
                 DEBUGPRINT ( "brightness trigger, nightMode enabled" );
                 setNewState ( true );
-            } else if ( strcmp ( brightnessActions[flCurrentProcessed], "disableNightMode" ) == 0 ) {
+            } else if ( !strcmp ( brightnessActions[flCurrentProcessed], "disableNightMode" ) ) {
                 DEBUGPRINT ( "brightness trigger, nightMode disabled" );
                 setNewState ( false );
-	    } else {
+            } else {
                 DEBUGPRINT ( "brightness trigger, executing command: '%s'", brightnessActions[flCurrentProcessed] );
                 system ( brightnessActions[flCurrentProcessed] );
             }
@@ -506,15 +517,10 @@ void *processFlChange ( void *flCounterStart_void_ptr ) {
     return NULL;
 }
 
-int system ( const char *command ) {
-  DEBUGPRINT ( "system called: %s", command );
-  return system_orig(command);
-}
-
 int ioctl ( int filp, unsigned long cmd, unsigned long arg ) {
-  
+
     //record last ioctl command executed (for auto switch-off feature
-    gettimeofday(&lastIoctlTime, NULL);
+    gettimeofday ( &lastIoctlTime, NULL );
 
     if ( cmd == MXCFB_SEND_UPDATE ) {
 
@@ -604,7 +610,7 @@ int ioctl ( int filp, unsigned long cmd, unsigned long arg ) {
             }
         }
     }
-    
+
     //DEBUGPRINT ( "ioctl cmd: %ld - arg: %ld", cmd, arg );
     return ioctl_orig ( filp, cmd, arg );
 }

@@ -46,7 +46,6 @@ lightButtonAction = toggleNighMode	# actions associated to long press of light b
 lightButtonCommand = /mnt/onboard/.kobo/testScript.sh
 [nightmode]
 refreshScreenPages = 0        # force refresh every X pages
-disableNightmode = yes        # yes / no
 [brightness]
 1percentPatch = yes # yes / no : Nickel set brightness to 2% even when on UI it is set to 1%
                     # this patch will force brightenss to 1% when:
