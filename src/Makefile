@@ -1,4 +1,4 @@
-LINUX_PATH = /home/sergio/Dev/kobo/libs/linux-2.6.35.3/
+LINUX_PATH =  ~/dev/kobo/libs/linux-2.6.35.3/
 GCC = arm-linux-gnueabihf-gcc
 INIPARSER = iniParser/iniparser.c iniParser/dictionary.c 
 
