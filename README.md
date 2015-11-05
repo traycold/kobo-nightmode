@@ -2,11 +2,14 @@ kobo-nightmode
 ==============
 
 A tiny hack to read white-on-black on Kobo ebook readers. Works only on the eInk series:
++ [Kobo Glo HD](http://kobo.com/koboglohd)
 + [Kobo Aura](http://kobo.com/koboaura)
 + [Kobo Aura HD](http://kobo.com/koboaurahd)
 + [Kobo Glo](http://kobo.com/koboglo)
 + [Kobo Touch](http://kobo.com/kobotouch)
 + [Kobo Mini](http://kobo.com/kobomini)
+
+Still working on 3.17 firmware
 
 Since the update to firmware 2.6+ Kobo has moved to hardware float proccessing, 
 requiring a new toolchain and partly breaking binary compatibility with older software. Currently this hack still works on  firmwares below 2.6, but it is highly recommended to upgrade.
@@ -27,6 +30,9 @@ As the Kobo Mini has no physical buttons, the fifo-interface is currently the on
 relies on external tools such as:
 + [KoboLauncher](http://www.mobileread.com/forums/showthread.php?t=201632), maintained by sergeyvl12
 + [Kobo Tweaks](http://www.mobileread.com/forums/showthread.php?t=206180), maintained by ah- (currently not available for 2.6+)
+
+As there is no power button on Glo HD need to adjust setting as described [here] (http://www.mobileread.com/forums/showpost.php?p=3155975&postcount=512) so that
+a particular brightness level toggles on the night mode
 
 Configuration
 -------------
